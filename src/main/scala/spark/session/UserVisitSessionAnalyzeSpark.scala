@@ -5,7 +5,7 @@ import java.util.Date
 import com.alibaba.fastjson.{JSON, JSONObject}
 import constant.Constants
 import dao.factory.DAOFactory
-import domain.{SessionAggrStat, SessionDetail, SessionRandomExtract, Top10Category}
+import domain._
 import org.apache.parquet.it.unimi.dsi.fastutil.ints.{IntArrayList, IntList}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{Row, SparkSession}
@@ -139,6 +139,18 @@ object UserVisitSessionAnalyzeSpark {
     // 6、获取排序后的前10个品类
     // 7、将top10热门品类的每个品类的点击下单支付次数写入数据库
     val top10CategoryList = getTop10Category(task.getTaskid, sessionId2DetailRDD)
+
+
+
+    // 获取top10活跃session
+    // 1、获取到符合筛选条件的session明细数据
+    // 2、按照session粒度的数据进行聚合，获取到session对应的每个品类的点击次数
+    // 3、按照品类id，分组取top10，并且获取到top10活跃session
+    // 4、结果的存储
+    getTop10Session(top10CategoryList, sessionId2DetailRDD, task.getTaskid, sc)
+
+
+
 
     spark.stop()
 
@@ -807,6 +819,7 @@ object UserVisitSessionAnalyzeSpark {
       top10CategoryDAO.insert(top10Category)
 
     }
+    top10CategoryList
   }
 
   /**
@@ -950,5 +963,203 @@ object UserVisitSessionAnalyzeSpark {
 
     tmpMapRDD
   }
+
+
+
+  /**
+  * top10活跃session
+ */
+  def getTop10Session(top10CategoryList: Array[(CategorySortKey, String)], sessionId2DetailRDD: RDD[(String, Row)], taskid: Long, sc: SparkContext) ={
+    /**
+      * 第一步：将top10热门品类id(categoryList)转换为RDD
+      * 生成的数据格式为：(categoryId, categoryId)
+      */
+    val top10CategoryListBuffer = new ListBuffer[(Long,Long)]
+    for (elem <- top10CategoryList) {
+      val categoryid = (StringUtils.getFieldFromConcatString(elem._2,"\\|",Constants.FIELD_CATEGORY_ID)).toLong
+      top10CategoryListBuffer.add((categoryid,categoryid))
+    }
+
+    // 用并行化的方式转换为RDD
+    val top10CategoryRDD = sc.parallelize(top10CategoryListBuffer.toList)
+
+    /**
+      * 第二步：计算出top10品类被各个session点击的次数
+      */
+    val top10CategorySessionClick = top10CategorySession(sessionId2DetailRDD,top10CategoryRDD)
+
+    /**
+      * 第三步：分组取topN算法，实现获取每个品类的top10活跃用户并写入数据库
+      */
+    val top10SessionRDD = calculateTop10Session(top10CategorySessionClick, taskid)
+    /**
+      * 第四步：获取top10活跃session的明细数据写入数据库
+      */
+    insertTop10SessionDetail(top10SessionRDD, sessionId2DetailRDD, taskid)
+  }
+
+
+  /**
+    * 计算每个session点击某个品类的次数
+    *
+    * @param sessionId2DetailRDD
+    * @param top10CategoryRDD
+    * @return
+    */
+  def top10CategorySession(sessionId2DetailRDD: RDD[(String, Row)], top10CategoryRDD: RDD[(Long, Long)]) = {
+    // 将明细数据以sessionId进行分组
+    val sessionDetails = sessionId2DetailRDD.groupByKey
+
+    // 将品类id对应的session和count生成为<category,"sessionId,count">
+    val categorySessionClickCount = sessionDetails.flatMap(tup=>{
+      val sessionid = tup._1
+      val it = tup._2.iterator
+
+      // 用来存储品类对应的点击次数<key=categoryId, value=次数>
+      val categoryCount = new mutable.HashMap[Long,Long]()
+      while (it.hasNext){
+        val row = it.next()
+        if(row.get(6)!=null){
+          val categoryId = row.getLong(6)
+          var count = 0L
+          if(categoryCount.get(categoryId).getOrElse(null)!=null){
+            count = categoryCount.get(categoryId).getOrElse(0L)
+            count += 1
+          }
+
+          categoryCount.put(categoryId,count)
+        }
+      }
+
+      // 返回一个结果List，格式为：<categoryId, "sessionId,count">
+      val list = new ListBuffer[(Long,String)]
+      for (elem <- categoryCount) {
+        val categoryId = elem._1
+        val count = elem._2
+        val value = sessionid+","+count
+        list += ((categoryId,value))
+      }
+      list
+    })
+    // 获取top10热门品类被各个session点击的次数：<categoryId, "sessionId,count">
+    val top10CategorySessionCount = top10CategoryRDD.join(categorySessionClickCount).map(tup=>{
+      (tup._1,tup._2._2)
+    })
+
+    top10CategorySessionCount
+  }
+  /**
+    * 获取每个品类的top10活跃用户
+    *
+    * @param top10CategorySessionClick
+    * @param taskid
+    * @return
+    */
+  def calculateTop10Session(top10CategorySessionClick: RDD[(Long, String)], taskid: Long) = {
+    // 以categoryId进行分组
+    val top10CategorySessionCountsRDD = top10CategorySessionClick.groupByKey
+
+    // 以每组top10session，分组取top10
+    val top10Session = top10CategorySessionCountsRDD.flatMap(tup=>{
+      val categoryId = tup._1
+      val it = tup._2.iterator
+
+      // 用来存储topN的排序数组
+      val top10Sessions = new Array[String](10)
+
+      while(it.hasNext){
+        // "session,count"
+        val sessionCount = it.next
+        val count = sessionCount.split(",")(1).toLong
+        // 遍历排序数组（topN算法)
+        var i = 0
+        import scala.util.control.Breaks._
+        breakable{
+          while(i < top10Sessions.length){
+            // 判断，如果当前索引下的数据为null，就直接将sessioncount赋值给当前的i位数据
+            if(top10Sessions(i) == null){
+              top10Sessions(i) = sessionCount
+              break
+            }else{
+              val _count = top10Sessions(i).split(",")(1).toLong
+              // 判断，如果sessionCount比i位的sessionCount（_count）大，
+              // 从排序数组最后一位开始，到i位，所有的数据往后挪一位
+              if (count > _count){
+                var j = 9
+                while (j>i){
+                  top10Sessions(j) = top10Sessions(j-1)
+                  j -= 1
+                }
+                // 将sessionCount赋值给top10Sessions的i位数据
+                top10Sessions(i) = sessionCount
+                break
+              }
+            }
+            i += 1
+          }
+        }
+      }
+
+      // 用来存储top10Sessions里的sessionId，格式为：<sessionId, sessionId>
+      val list = new ListBuffer[(String,String)]
+      // 将数据写入到数据库中
+      for (elem <- top10Sessions) {
+        if(elem != null){
+          val sessionId = elem.split(",")(0)
+          val count = elem.split(",")(1).toLong
+          val top10Session = new Top10Session
+          top10Session.setTaskid(taskid)
+          top10Session.setSessionid(sessionId)
+          top10Session.setCategoryid(categoryId)
+          top10Session.setClickCount(count)
+
+          val top10SessionDAO = DAOFactory.getTop10SessionDAO
+          top10SessionDAO.insert(top10Session)
+          list += ((sessionId,sessionId))
+        }
+      }
+      list
+
+    })
+    top10Session
+  }
+
+  /**
+    * 将top10活跃session的明细数据写入数据库
+    * @param top10SessionRDD
+    * @param sessionId2DetailRDD
+    * @param taskid
+    * @return
+    */
+  def insertTop10SessionDetail(top10SessionRDD: RDD[(String, String)], sessionId2DetailRDD: RDD[(String, Row)], taskid: Long) ={
+    // (String,(String,row))
+    val sessionDetailsRDD = top10SessionRDD.join(sessionId2DetailRDD)
+    sessionDetailsRDD.foreach(tup=>{
+      // 获取session的明细数据
+      val row = tup._2._2
+      val sessionDetail = new SessionDetail
+      sessionDetail.setTaskid(taskid)
+      sessionDetail.setUserid(row.getLong(1))
+      sessionDetail.setSessionid(row.getString(2))
+      sessionDetail.setPageid(row.getLong(3))
+      sessionDetail.setActionTime(row.getString(4))
+      sessionDetail.setSearchKeyword(row.getString(5))
+      if (!row.isNullAt(6)) {
+        sessionDetail.setClickCategoryId(row.getLong(6))
+      }
+      if (!row.isNullAt(7)) {
+        sessionDetail.setClickProductId(row.getLong(7))
+      }
+      sessionDetail.setOrderCategoryIds(row.getString(8))
+      sessionDetail.setOrderProductIds(row.getString(9))
+      sessionDetail.setPayCategoryIds(row.getString(10))
+      sessionDetail.setPayProductIds(row.getString(11))
+
+      val sessionDetailDAO = DAOFactory.getSessionDetailDAO
+      sessionDetailDAO.insert(sessionDetail)
+    })
+  }
+
+
 
 }
