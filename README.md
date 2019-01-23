@@ -8,7 +8,7 @@
     |jdbc:用来jdbc的工具类
     |model：存放了实时分析中用到的模板类
     |test：用来生成模拟数据
-    |util: 存放了项目中常用到的工具了类，有StringUtils，DateUtils。。。
+    |util: 存放了项目中常用到的工具了类，有StringUtils，DateUtils...
  |scala
     |spark
     |accumulator:存放累加器的类
