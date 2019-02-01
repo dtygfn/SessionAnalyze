@@ -235,7 +235,7 @@ object PageOneStepConvetRete {
       var lastPageId = -1L
       // 注意：现在拿到的rows里的数据是其中一个sessionId对应的所有行为数据
       for (row <- sortedRows) {
-        val pageId = row.getLong(4)
+        val pageId = row.getLong(3)
         breakable {
           if (lastPageId == -1L) {
             lastPageId = pageId
