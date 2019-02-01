@@ -182,10 +182,11 @@ object AreaTop3ProductSpark {
     val mappedRDD = joinedRDD.map(tup=>{
       val cityId = tup._1
       val clickAction = tup._2._1
-      val cityInfo = tup._2._1
+      val cityInfo = tup._2._2
       val productId = clickAction.getLong(1)
-      val cityName  = cityInfo.getString(1)
+      val cityName = cityInfo.getString(1)
       val area = cityInfo.getString(2)
+
       Row(cityId,cityName,area,productId)
     })
 
