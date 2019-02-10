@@ -1,13 +1,13 @@
 package spark.ad
 
 import java.util.Date
-import scala.collection.JavaConversions._
 
+import scala.collection.JavaConversions._
 import conf.ConfigurationManager
 import constant.Constants
 import kafka.serializer.StringDecoder
 import org.apache.spark.{SparkConf, SparkContext}
-import org.apache.spark.streaming.dstream.InputDStream
+import org.apache.spark.streaming.dstream.{DStream, InputDStream}
 import org.apache.spark.streaming.kafka.KafkaUtils
 import org.apache.spark.streaming.{Seconds, StreamingContext}
 import spark.util.SparkUtils
@@ -15,7 +15,8 @@ import util.DateUtils
 import java.util
 
 import dao.factory.DAOFactory
-import domain.{AdBlacklist, AdUserClickCount}
+import domain.{AdBlacklist, AdStat, AdUserClickCount}
+import org.apache.spark.rdd.RDD
 
 /**
   * 广告点击流量实时统计
@@ -30,6 +31,8 @@ import domain.{AdBlacklist, AdUserClickCount}
   * 7、使用窗口操作，对最近1小时的窗口内的数据，计算出各广告每分钟的点击量，实时更新到数据库
   */
 object AdClickRealTimeStatSpark extends Serializable {
+
+
 
   def main(args: Array[String]): Unit = { // 模板代码
     val conf = new SparkConf()
@@ -66,10 +69,80 @@ object AdClickRealTimeStatSpark extends Serializable {
     val blackListRDD = getBlackListToRDD(sc)
 
     // 根据动态黑名单进行数据过滤
-
-
+    val filteredAdRealTimeLogDStream = filteredByBlackList(blackListRDD, message)
+    // 业务一：计算每天各省各城市各广告的点击流量实时统计
+    // 生成的数据格式为：<yyyyMMdd_province_city_adId, clickCount>
+    val adRealTimeStatDStream = calcuateRealTimeStat(filteredAdRealTimeLogDStream)
+    // 业务二：统计每天各省top3热门广告
+    calculateProvinceTop3Ad(adRealTimeStatDStream)
 
   }
+
+  /**
+    * 实现过滤黑名单机制
+    *
+    * @param message
+    * @return
+    */
+  def filteredByBlackList(blackListRDD: RDD[(Long, Boolean)], message: InputDStream[(String, String)]) = {
+    // 接收到原始的用户点击行为日志后，根据数据库黑名单，进行实施过滤
+    // 使用transform将DStream中的每个batch RDD进行处理，转换为任意其它的RDD
+    // 返回的格式为：<userId, tup>  tup=<offset,(timestamp province city userId adId)>
+    val filteredAdRealTimeLogDStream = message.transform(rdd=>{
+      // 将原始数据RDD映射为<userId, Tuple2<kafka-key, kafka-value>>
+      val mappedRDD = rdd.map(tup=>{
+        // 获取用户点击行为
+        val log = tup._2
+
+        // 切分，原始数据的格式为：<offset,(timestamp province city userId adId)>
+        val logSplited = log.split(" ")
+        val userId = logSplited(3).toLong
+
+        (userId,tup)
+      })
+
+      // 将原始日志数据与黑名单RDD进行join，此时需要使用leftOuterJoin
+      // 如果原始日志userId没有在对应的黑名单，一定是join不到的
+      val joinedRDD = mappedRDD.leftOuterJoin(blackListRDD)
+
+      // 过滤黑名单
+      val filteredRDD = joinedRDD.filter(tup=>{
+        // 获取join过来的黑名单的userId对应的Bool值
+        val optional = tup._2._2
+        // 如果这个值存在，说明原始日志中userId join到了某个黑名单用户，就过滤掉
+        if(optional.nonEmpty&&optional.get){
+          false
+        }else{
+          true
+        }
+      })
+      // 返回根据黑名单过滤后的数据
+      val resultRDD = filteredRDD.map(tup=>tup._2._1)
+      resultRDD
+    })
+    filteredAdRealTimeLogDStream
+  }
+  /**
+    * 获取黑名单，并转换为RDD
+    * @param sc
+    * @return
+    */
+  def getBlackListToRDD(sc: SparkContext) = {
+    val adBlacklistDAO = DAOFactory.getAdBlacklistDAO
+    val adBlacklists = adBlacklistDAO.findAll
+
+    // 封装黑名单用户，格式为：<userId, true>
+    val tuples = new util.ArrayList[(Long, Boolean)]
+    for (adBlacklist <- adBlacklists) {
+      tuples.add((adBlacklist.getUserid, true))
+    }
+
+    // 把获取的黑名单信息生成RDD
+    val blackListRDD = sc.parallelize(tuples)
+
+    blackListRDD
+  }
+
 
   /**
     * 动态生成黑名单
@@ -180,26 +253,96 @@ object AdClickRealTimeStatSpark extends Serializable {
 
   }
 
-  /**
-    * 获取黑名单，并转换为RDD
-    * @param sc
-    * @return
-    */
-  def getBlackListToRDD(sc: SparkContext) = {
-    val adBlacklistDAO = DAOFactory.getAdBlacklistDAO
-    val adBlacklists = adBlacklistDAO.findAll
 
-    // 封装黑名单用户，格式为：<userId, true>
-    val tuples = new util.ArrayList[(Long, Boolean)]
-    for (adBlacklist <- adBlacklists) {
-      tuples.add((adBlacklist.getUserid, true))
+  /**
+    * 计算每天各省各城市各广告的点击流量实时统计
+    *
+    * @param filteredAdRealTimeLogDStream
+    * @return
+  */
+  def calcuateRealTimeStat(filteredAdRealTimeLogDStream: DStream[(String, String)]) = {
+    /**
+      * 计算该业务，会实时的把结果更新到数据库中
+      * J2EE平台就会把结果实时的以各种效果展示出来
+      * J2EE平台会每隔几分钟从数据库中获取一次最新的数据
+      */
+    // 对原始数据进行map，把结果映射为：<date_province_city_adId, 1L>
+    val mappedDStream  = filteredAdRealTimeLogDStream.map(tup=>{
+      // 把原始数据进行切分并且获取各字段
+      val logSplited = tup._2.split(" ")
+      val timestamp = logSplited(0)
+      val date = new Date(timestamp.toLong)
+      val dateKey = DateUtils.formatDateKey(date)
+
+      // yyyyMMdd
+      val province = logSplited(1)
+      val city = logSplited(2)
+      val adId = logSplited(4)
+      val key = dateKey+"_"+province+"_"+city+"_"+adId
+
+      (key,1L)
+    })
+
+    // 聚合，按批次累加
+    // 在这个DStream中，相当于每天各省各城市各广告的点击次数
+    val upstateFun = (values: Seq[Long], state: Option[Long]) => {
+      // state存储的是历史批次结果
+      // 首先根据state来判断，之前的这个key值是否有对应的值
+      var clickCount = 0L
+
+      // 如果之前存在值，就以之前的状态作为起点，进行值的累加
+      if (state.nonEmpty) clickCount = state.getOrElse(0L)
+
+      // values代表当前batch RDD中每个key对应的所有的值
+      // 比如当前batch RDD中点击量为4，values=(1,1,1,1)
+      for (value <- values) {
+        clickCount += value
+      }
+
+      Option(clickCount)
     }
 
-    // 把获取的黑名单信息生成RDD
-    val blackListRDD = sc.parallelize(tuples)
+    val aggrDStream = mappedDStream.updateStateByKey(upstateFun)
 
-    blackListRDD
+    // 将结果持久化
+    aggrDStream.foreachRDD(rdd=>{
+      rdd.foreachPartition(it=>{
+        val adStats = new util.ArrayList[AdStat]()
+        while(it.hasNext){
+          val tuple = it.next()
+          val keySplited = tuple._1.split("_")
+
+          val date = keySplited(0)
+          val provice = keySplited(1)
+          val city = keySplited(2)
+          val adId = keySplited(3).toLong
+          val clickCount = tuple._2.toLong
+
+          val adStat = new AdStat
+          adStat.setDate(date)
+          adStat.setProvince(provice)
+          adStat.setCity(city)
+          adStat.setAdid(adId)
+          adStat.setClickCount(clickCount)
+
+          adStats.add(adStat)
+        }
+
+        val adStatDAO = DAOFactory.getAdStatDAO
+        adStatDAO.updateBatch(adStats)
+      })
+    })
+
+    aggrDStream
   }
+
+  /**
+    * 计每天各省top3热门广告
+    *
+    * @param adRealTimeStatDStream
+    */
+  def calculateProvinceTop3Ad(adRealTimeStatDStream: DStream[(String, Long)]): Unit = ???
+
 
 
 }
